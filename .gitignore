@@ -1,0 +1,16 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Local environment / secrets. Never commit a Stellar secret seed.
+.env
+.env.*
+!.env.example
+
+# Operator-local configuration overrides
+*.local.toml
+rent-keeper.toml
+
+# Local data / scratch
+/data
+/plans

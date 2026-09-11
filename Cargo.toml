@@ -1,0 +1,70 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/rentkeeper-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "Apache-2.0"
+repository = "https://github.com/soroban-rent-keeper/soroban-rent-keeper"
+homepage = "https://github.com/soroban-rent-keeper/soroban-rent-keeper"
+authors = ["Soroban Rent Keeper contributors"]
+keywords = ["stellar", "soroban", "rent", "ttl", "storage-archival"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+# Internal
+rentkeeper-core = { path = "crates/rentkeeper-core", version = "0.1.0" }
+
+# Stellar / Soroban
+stellar-rpc-client = "27.0.0"
+stellar-xdr = { version = "27.0.0", features = ["std", "serde", "base64"] }
+stellar-strkey = "0.0.16"
+
+# Crypto
+ed25519-dalek = "2.2"
+sha2 = "0.10"
+
+# Runtime / CLI / telemetry
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+humantime-serde = "1.1"
+prometheus = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "time",
+  "sync",
+  "net",
+] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+todo = "warn"
+dbg_macro = "warn"
+# Pedantic lints worth enforcing on a service that moves real money.
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+cast_precision_loss = "warn"
+float_cmp = "warn"
+await_holding_lock = "warn"
+inefficient_to_string = "warn"
+redundant_clone = "warn"
+large_enum_variant = "warn"

@@ -1,0 +1,30 @@
+[package]
+name = "rentkeeper-core"
+description = "Shared ledger/state-archival planning, risk-window, and Soroban transaction-building primitives for the Soroban Rent Keeper framework."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+stellar-rpc-client.workspace = true
+stellar-strkey.workspace = true
+stellar-xdr.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
