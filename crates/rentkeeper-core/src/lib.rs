@@ -3,8 +3,10 @@
 
 pub mod error;
 pub mod ledger_keys;
+pub mod plan;
 pub mod ttl;
 
 pub use error::RentkeeperError;
 pub use ledger_keys::LedgerKeys;
+pub use plan::{ArchivalPlan, OperationKind, PlanEntry};
 pub use ttl::{EntryTtl, RiskWindow, TtlConstants};
