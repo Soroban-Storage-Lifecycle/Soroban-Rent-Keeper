@@ -7,4 +7,4 @@ pub mod ttl;
 
 pub use error::RentkeeperError;
 pub use ledger_keys::LedgerKeys;
-pub use ttl::{EntryTtl, TtlConstants};
+pub use ttl::{EntryTtl, RiskWindow, TtlConstants};
