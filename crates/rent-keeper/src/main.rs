@@ -5,6 +5,7 @@ mod config;
 mod metrics;
 mod metrics_server;
 mod secret;
+mod sequence;
 mod watcher;
 
 use std::path::PathBuf;
@@ -12,6 +13,8 @@ use std::path::PathBuf;
 use clap::Parser as _;
 use rentkeeper_core::tx::FeePayer;
 use rentkeeper_core::SorobanProvider;
+
+use sequence::SequenceTracker;
 
 /// Long-running keeper options.
 #[derive(Debug, clap::Parser)]
@@ -114,45 +117,105 @@ async fn main() {
         });
     }
 
-    run_loop(&provider, &valid, &payer, &shared_metrics).await;
+    let sequence = SequenceTracker::new(provider.clone(), payer.account_id_strkey());
+    run_loop(&provider, &valid, &payer, &shared_metrics, &sequence).await;
 }
+
+/// Bounds for transient-failure retries within one cycle.
+const RETRY_ATTEMPTS: usize = 3;
+const RETRY_BASE_DELAY_MS: u64 = 1_000;
 
 async fn run_loop(
     provider: &SorobanProvider,
     config: &config::ValidConfig,
     payer: &FeePayer,
     shared_metrics: &metrics::SharedMetrics,
+    sequence: &SequenceTracker,
 ) {
     let mut ticker = tokio::time::interval(config.poll_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(sig) => sig,
+        Err(err) => {
+            tracing::error!(error = %err, "cannot install SIGTERM handler");
+            return;
+        }
+    };
+    let mut sigint = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    {
+        Ok(sig) => sig,
+        Err(err) => {
+            tracing::error!(error = %err, "cannot install SIGINT handler");
+            return;
+        }
+    };
+
     loop {
-        ticker.tick().await;
-        match watcher::run_cycle(provider, config, payer).await {
-            Ok(report) => {
-                shared_metrics.poll_cycles.inc();
-                shared_metrics
-                    .latest_observed_ledger
-                    .set(i64::from(report.observed_ledger));
-                shared_metrics
-                    .entries_at_risk
-                    .set(i64::try_from(report.entries_at_risk).unwrap_or(i64::MAX));
-                if report.extend_submitted {
-                    shared_metrics.extends_submitted.inc();
-                    shared_metrics.extends_accepted.inc();
-                }
-                tracing::info!(
-                    ledger = report.observed_ledger,
-                    at_risk = report.entries_at_risk,
-                    submitted = report.extend_submitted,
-                    "cycle complete"
-                );
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM received; shutting down");
+                break;
             }
-            Err(err) => {
-                tracing::error!(error = %err, "poll cycle failed");
-                if matches!(err, watcher::KeeperError::Rpc(_)) {
-                    shared_metrics.extends_rejected.inc();
+            _ = sigint.recv() => {
+                tracing::info!("SIGINT received; shutting down");
+                break;
+            }
+        }
+
+        // Bounded retries for transient RPC failures within the cycle.
+        let mut attempt = 0usize;
+        loop {
+            match watcher::run_cycle(provider, config, payer, sequence).await {
+                Ok(report) => {
+                    shared_metrics.poll_cycles.inc();
+                    shared_metrics
+                        .latest_observed_ledger
+                        .set(i64::from(report.observed_ledger));
+                    shared_metrics
+                        .entries_at_risk
+                        .set(i64::try_from(report.entries_at_risk).unwrap_or(i64::MAX));
+                    shared_metrics
+                        .extends_submitted
+                        .inc_by(u64::try_from(report.transactions).unwrap_or(u64::MAX));
+                    if report.extend_submitted {
+                        shared_metrics.extends_accepted.inc();
+                    }
+                    tracing::info!(
+                        ledger = report.observed_ledger,
+                        at_risk = report.entries_at_risk,
+                        submitted = report.transactions,
+                        "cycle complete"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    attempt += 1;
+                    if attempt >= RETRY_ATTEMPTS || !is_transient(&err) {
+                        tracing::error!(error = %err, attempts = attempt, "cycle failed");
+                        if matches!(err, watcher::KeeperError::Rpc(_)) {
+                            shared_metrics.extends_rejected.inc();
+                        }
+                        break;
+                    }
+                    let delay = RETRY_BASE_DELAY_MS * (1 << (attempt - 1));
+                    tracing::warn!(
+                        error = %err,
+                        attempt,
+                        delay_ms = delay,
+                        "transient failure; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
             }
         }
     }
+    tracing::info!("rent-keeper stopped");
+}
+
+/// Only transport-level RPC failures are retried; validation and transaction
+/// errors are deterministic and re-planning will not fix them.
+fn is_transient(err: &watcher::KeeperError) -> bool {
+    matches!(err, watcher::KeeperError::Rpc(_))
 }

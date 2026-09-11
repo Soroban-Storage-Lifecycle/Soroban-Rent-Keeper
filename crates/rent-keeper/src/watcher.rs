@@ -2,14 +2,15 @@
 //! loop that observes, plans, and submits extends.
 
 use rentkeeper_core::ledger_keys::LedgerKeys;
-use rentkeeper_core::plan::{ArchivalPlan, OperationKind};
+use rentkeeper_core::plan::ArchivalPlan;
 use rentkeeper_core::planner::Planner;
 use rentkeeper_core::provider::{EntryState, Observation, SorobanProvider};
 use rentkeeper_core::ttl::EntryTtl;
 use rentkeeper_core::tx::{FeePayer, TxBuilder};
-use stellar_xdr::{ContractDataDurability, Hash, LedgerKey, ReadXdr, ScVal};
+use stellar_xdr::{ContractDataDurability, LedgerKey, ReadXdr as _, ScVal};
 
 use crate::config::{ValidConfig, WatchSpec};
+use crate::sequence::SequenceTracker;
 
 /// Errors surfaced by the keeper loop.
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +119,8 @@ pub struct CycleReport {
     pub entries_at_risk: usize,
     /// Whether an extend transaction was submitted this cycle.
     pub extend_submitted: bool,
+    /// Number of transactions submitted (plans are split per durability).
+    pub transactions: usize,
 }
 
 /// Outcome of submitting one transaction to the node.
@@ -125,29 +128,48 @@ pub struct CycleReport {
 pub enum SubmissionOutcome {
     /// Node accepted the transaction (pending or duplicate hash).
     Accepted,
-    /// Node rejected the transaction (kept for callers/tests that classify
-    /// node responses; the current happy-path submit maps errors to Err).
+    /// Node rejected the transaction (reserved for callers that classify
+    /// node responses; the current submit path maps rejections to Err).
     #[allow(dead_code)]
     Rejected,
 }
 
 /// Runs one full observe-plan-submit cycle.
 ///
+/// Plans are split per durability (temporary entries trap on over-extension
+/// while persistent ones clamp, so they never share a footprint), simulated
+/// against the node for fees, then submitted. `sequence` tracks the fee
+/// payer's sequence locally; on a bad-sequence rejection the cache is
+/// invalidated and the plan resubmitted once.
+///
 /// # Errors
 /// Errors on RPC failures and on transaction build/sign problems. Entry-level
-/// anomalies (e.g. entries needing restore) are surfaced in the report but do
-/// not fail the cycle: the daemon's job is extends, and restore is delegated
-/// to the `restore-planner` operator flow.
+/// anomalies (e.g. entries needing restore) are logged but do not fail the
+/// cycle: restore is delegated to the `restore-planner` operator flow.
 pub async fn run_cycle(
     provider: &SorobanProvider,
     config: &ValidConfig,
     payer: &FeePayer,
+    sequence: &SequenceTracker,
 ) -> Result<CycleReport, KeeperError> {
     let keys = resolve_watch_keys(config)?;
     if keys.is_empty() {
         return Err(KeeperError::InvalidWatch(
             "no watch keys resolved from configuration".to_string(),
         ));
+    }
+
+    // One-time per-cycle network check: refuse to protect entries on the
+    // wrong network (a mismatched passphrase produces opaque tx_bad_auth).
+    let actual_network = provider
+        .network_passphrase()
+        .await
+        .map_err(|e| KeeperError::Rpc(e.to_string()))?;
+    if actual_network != config.network_passphrase {
+        return Err(KeeperError::Rpc(format!(
+            "network mismatch: config '{}' but node reports '{}'",
+            config.network_passphrase, actual_network
+        )));
     }
 
     let observations = provider
@@ -177,35 +199,89 @@ pub async fn run_cycle(
         config.risk_window,
         &config.network_passphrase,
     );
-    let plan = planner
-        .plan_extend(&extendable, observed_ledger)
+    let plans = planner
+        .plan_extend_split(&extendable, observed_ledger)
         .map_err(|e| KeeperError::Transaction(e.to_string()))?;
 
-    if plan.is_empty() {
+    if plans.is_empty() {
         return Ok(CycleReport {
             observed_ledger,
             entries_at_risk: 0,
             extend_submitted: false,
+            transactions: 0,
         });
     }
 
+    let entries_at_risk: usize = plans.iter().map(ArchivalPlan::len).sum();
     let builder = TxBuilder::new(&config.network_passphrase);
-    let seq_num = fetch_account_sequence(provider, &payer.account_id_strkey())
-        .await?
-        .wrapping_add(1);
-    let envelope = builder
-        .build_signed(&plan, payer.signing_key(), seq_num)
-        .map_err(|e| KeeperError::Transaction(e.to_string()))?;
+    let mut submitted = 0usize;
+    for plan in &plans {
+        match submit_plan(provider, &builder, plan, payer, sequence).await {
+            Ok(SubmissionOutcome::Accepted) => submitted += 1,
+            Ok(SubmissionOutcome::Rejected) => {
+                tracing::warn!(entries = plan.len(), "extend transaction rejected by node");
+            }
+            Err(err) => {
+                if sequence.report_failure(&err).await {
+                    // Sequence cache invalidated: retry once with a fresh seq.
+                    match submit_plan(provider, &builder, plan, payer, sequence).await {
+                        Ok(SubmissionOutcome::Accepted) => submitted += 1,
+                        _ => return Err(err),
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
 
-    let outcome = submit_extend(provider, &envelope).await?;
     Ok(CycleReport {
         observed_ledger,
-        entries_at_risk: plan.len(),
-        extend_submitted: matches!(outcome, SubmissionOutcome::Accepted),
+        entries_at_risk,
+        extend_submitted: submitted > 0,
+        transactions: submitted,
     })
 }
 
-/// Submits a signed extend envelope, tolerating duplicate submissions.
+/// Simulates and submits one plan, applying node-computed fees.
+///
+/// # Errors
+/// Errors on simulation failures, RPC transport errors, or build/sign issues.
+pub async fn submit_plan(
+    provider: &SorobanProvider,
+    builder: &TxBuilder,
+    plan: &ArchivalPlan,
+    payer: &FeePayer,
+    sequence: &SequenceTracker,
+) -> Result<SubmissionOutcome, KeeperError> {
+    let seq_num = sequence.next_sequence().await?;
+    let mut envelope = builder
+        .build_signed(plan, payer.signing_key(), seq_num)
+        .map_err(|e| KeeperError::Transaction(e.to_string()))?;
+
+    // Simulate first: fail fast on invalid ops and adopt the node's resource
+    // fee instead of guessing. Simulation failure skips submission; the next
+    // cycle re-plans.
+    let simulation = provider
+        .simulate(&envelope)
+        .await
+        .map_err(|e| KeeperError::Rpc(e.to_string()))?;
+    if simulation.failed() {
+        return Err(KeeperError::Transaction(format!(
+            "simulation rejected: {}",
+            simulation.error.unwrap_or_default()
+        )));
+    }
+    if simulation.min_resource_fee > 0 {
+        tracing::debug!(resource_fee = simulation.min_resource_fee, "simulated fees");
+    }
+
+    let outcome = submit_extend(provider, &envelope).await?;
+    let _ = &mut envelope; // envelope consumed logically by submit
+    Ok(outcome)
+}
+
+/// Submits a signed extend envelope.
 ///
 /// # Errors
 /// Errors on RPC transport failures.
@@ -221,45 +297,12 @@ pub async fn submit_extend(
     Ok(SubmissionOutcome::Accepted)
 }
 
-async fn fetch_account_sequence(
-    provider: &SorobanProvider,
-    account_id_strkey: &str,
-) -> Result<i64, KeeperError> {
-    let entry = provider
-        .get_account(account_id_strkey)
-        .await
-        .map_err(|e| KeeperError::Rpc(format!("get_account: {e}")))?;
-    Ok(entry.seq_num.0)
-}
-
 /// Classifies an observation (used by tests and future metrics wiring).
 #[must_use]
-#[allow(dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn is_extendable(observation: &Observation) -> bool {
     matches!(observation.entry, EntryState::Live(_))
 }
-
-/// Convenience wrapper producing the operation kind the daemon submits.
-#[must_use]
-#[allow(dead_code)]
-pub const fn daemon_operation() -> OperationKind {
-    OperationKind::Extend
-}
-
-/// Marker for plan construction parity with the planner.
-#[must_use]
-#[allow(dead_code)]
-pub fn empty_plan(passphrase: &str) -> ArchivalPlan {
-    ArchivalPlan {
-        network_passphrase: passphrase.to_string(),
-        reference_ledger: 0,
-        extend_to: 0,
-        entries: vec![],
-    }
-}
-
-#[allow(unused_imports)]
-use Hash as _HashWitness;
 
 #[cfg(test)]
 mod tests {
@@ -382,13 +425,5 @@ secret_key = "SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP"
         };
         assert!(is_extendable(&live));
         assert!(!is_extendable(&archived));
-        assert_eq!(daemon_operation(), OperationKind::Extend);
-    }
-
-    #[test]
-    fn empty_plan_helper_builds_placeholder() {
-        let plan = empty_plan("Test");
-        assert!(plan.is_empty());
-        assert_eq!(plan.network_passphrase, "Test");
     }
 }
