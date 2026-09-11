@@ -133,7 +133,9 @@ ledger (not an increment), persistent entries are clamped by the network's
 ## Development
 
 ```bash
-cargo test --workspace            # unit tests (63)
+cargo test --workspace            # unit tests (73)
+cargo test -p rentkeeper-core --test integration \
+  --features integration-tests -- --ignored   # optional live testnet checks
 cargo clippy --workspace --all-targets   # zero warnings expected
 cargo fmt --all -- --check
 ```
