@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/rentkeeper-core",
+  "crates/rent-keeper",
 ]
 
 [workspace.package]
