@@ -5,5 +5,6 @@
 mod config;
 mod metrics;
 mod metrics_server;
+mod watcher;
 
 fn main() {}
