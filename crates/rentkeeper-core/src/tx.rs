@@ -8,9 +8,9 @@
 use ed25519_dalek::{Signer as _, SigningKey};
 use sha2::Digest;
 use stellar_xdr::{
-    AccountId, DecoratedSignature, ExtendFootprintTtlOp, ExtensionPoint, LedgerFootprint, Limits,
-    Memo, MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, RestoreFootprintOp,
-    SequenceNumber, Signature, SignatureHint, SignerKey, SorobanResources, SorobanTransactionData,
+    DecoratedSignature, ExtendFootprintTtlOp, ExtensionPoint, LedgerFootprint, Limits, Memo,
+    MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, RestoreFootprintOp,
+    SequenceNumber, Signature, SignatureHint, SorobanResources, SorobanTransactionData,
     SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
     TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
@@ -267,14 +267,6 @@ impl FeePayer {
         &self.signing_key
     }
 }
-
-/// Ensures the signer module references the account id type for doc builds.
-#[allow(dead_code)]
-type AccountIdWitness = AccountId;
-
-/// Ensures the signer module references the signer key type for doc builds.
-#[allow(dead_code)]
-type SignerKeyWitness = SignerKey;
 
 #[cfg(test)]
 mod tests {
