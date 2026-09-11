@@ -15,4 +15,4 @@ pub use plan::{ArchivalPlan, OperationKind, PlanEntry};
 pub use planner::{Planner, TtlVerdict};
 pub use provider::{EntryState, Observation, SorobanProvider};
 pub use ttl::{EntryTtl, RiskWindow, TtlConstants};
-pub use tx::{TxBuilder, DEFAULT_BASE_FEE};
+pub use tx::{FeePayer, TxBuilder, DEFAULT_BASE_FEE};
