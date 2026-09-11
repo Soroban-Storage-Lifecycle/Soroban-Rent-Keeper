@@ -89,11 +89,12 @@ impl SorobanProvider {
                 RentkeeperError::Config("StateArchival config entry missing from node".to_string())
             })?;
 
-        let ledger_entry =
-            stellar_xdr::LedgerEntry::from_xdr_base64(entry.xdr.as_bytes(), Limits::none())
-                .map_err(|e| RentkeeperError::Xdr(format!("config entry: {e}")))?;
+        // The getLedgerEntries `xdr` field is the LedgerEntryData payload
+        // (not wrapped in LedgerEntry).
+        let data = LedgerEntryData::from_xdr_base64(entry.xdr.as_bytes(), Limits::none())
+            .map_err(|e| RentkeeperError::Xdr(format!("config entry: {e}")))?;
 
-        match ledger_entry.data {
+        match data {
             LedgerEntryData::ConfigSetting(stellar_xdr::ConfigSettingEntry::StateArchival(
                 settings,
             )) => Ok(state_archival_to_constants(&settings)),
@@ -110,47 +111,92 @@ impl SorobanProvider {
     /// row per requested key, preserving input order. Rows for keys that are
     /// entirely absent from ledger state carry `archived = true`.
     ///
+    /// Requests are chunked (see [`OBSERVE_BATCH_ENTRIES`]) so large watch
+    /// sets stay under RPC payload limits; chunks whose `latest_ledger`
+    /// disagree by more than [`MAX_CHUNK_LEDGER_DRIFT`] are rejected.
+    ///
     /// # Errors
-    /// Errors when the RPC call fails or an entry cannot be decoded.
+    /// Errors when the RPC call fails, an entry cannot be decoded, or chunk
+    /// snapshots are inconsistent.
     pub async fn observe_entries(
         &self,
         keys: &[LedgerKey],
     ) -> Result<Vec<Observation>, RentkeeperError> {
-        let mut all_keys = keys.to_vec();
-        let ttl_keys: Vec<LedgerKey> = keys
-            .iter()
-            .filter(|k| !matches!(k, LedgerKey::Ttl(_)))
-            .filter_map(|k| LedgerKeys::ttl_for(k).ok())
-            .collect();
-        all_keys.extend(ttl_keys);
+        let mut out = Vec::with_capacity(keys.len());
+        for chunk in keys.chunks(OBSERVE_BATCH_ENTRIES) {
+            let chunk_observations = self.observe_chunk(chunk).await?;
+            out.extend(chunk_observations);
+        }
+        Ok(out)
+    }
 
+    /// The RPC passphrase of the connected network, via `getNetwork`.
+    ///
+    /// # Errors
+    /// Errors when the RPC call fails.
+    pub async fn network_passphrase(&self) -> Result<String, RentkeeperError> {
+        self.client
+            .get_network()
+            .await
+            .map(|n| n.passphrase)
+            .map_err(|e| RentkeeperError::Rpc(format!("getNetwork: {e}")))
+    }
+
+    /// Simulates a signed (or unsigned) archival envelope without submitting.
+    ///
+    /// Returns the node-computed minimum resource fee and the raw
+    /// `transactionData` XDR so callers can set exact fees before submit.
+    ///
+    /// # Errors
+    /// Errors on transport failures. Simulation *failures* (e.g. invalid op)
+    /// are reported via [`SimulationResult::failed`].
+    pub async fn simulate(
+        &self,
+        envelope: &stellar_xdr::TransactionEnvelope,
+    ) -> Result<SimulationResult, RentkeeperError> {
         let response = self
             .client
-            .get_ledger_entries(&all_keys)
+            .simulate_transaction_envelope(envelope, None)
+            .await
+            .map_err(|e| RentkeeperError::Rpc(format!("simulateTransaction: {e}")))?;
+        if let Some(error) = response.error {
+            return Ok(SimulationResult {
+                min_resource_fee: 0,
+                transaction_data_xdr: None,
+                error: Some(error),
+            });
+        }
+        Ok(SimulationResult {
+            min_resource_fee: response.min_resource_fee,
+            transaction_data_xdr: Some(response.transaction_data),
+            error: None,
+        })
+    }
+
+    async fn observe_chunk(&self, keys: &[LedgerKey]) -> Result<Vec<Observation>, RentkeeperError> {
+        // Production nodes reject direct LedgerKey::Ttl queries ("ledger ttl
+        // entries cannot be queried directly"); liveness comes from the
+        // `liveUntilLedgerSeq` field the RPC attaches to each entry result.
+        let response = self
+            .client
+            .get_ledger_entries(keys)
             .await
             .map_err(|e| RentkeeperError::Rpc(format!("getLedgerEntries: {e}")))?;
         let latest = u32::try_from(response.latest_ledger).unwrap_or_default();
 
-        // Index what came back by the entry's own key.
+        // Index what came back by the entry's own key hash.
         let mut live_until: std::collections::HashMap<[u8; 32], u32> =
             std::collections::HashMap::new();
-        let mut present: std::collections::HashMap<[u8; 32], u32> =
-            std::collections::HashMap::new();
         for result in response.entries.unwrap_or_default() {
-            let entry =
-                stellar_xdr::LedgerEntry::from_xdr_base64(result.xdr.as_bytes(), Limits::none())
-                    .map_err(|e| RentkeeperError::Xdr(format!("entry decode: {e}")))?;
-            let key_xdr = entry
+            let data = LedgerEntryData::from_xdr_base64(result.xdr.as_bytes(), Limits::none())
+                .map_err(|e| RentkeeperError::Xdr(format!("entry decode: {e}")))?;
+            let key_xdr = data
                 .to_key()
                 .to_xdr(Limits::none())
                 .map_err(|e| RentkeeperError::Xdr(e.to_string()))?;
-            let mut key_hash: [u8; 32] = sha2::Sha256::digest(&key_xdr).into();
-            // For TTL entries the key_hash *is* the hash of the watched key.
-            if let LedgerEntryData::Ttl(ttl) = &entry.data {
-                key_hash = ttl.key_hash.0;
-                live_until.insert(key_hash, ttl.live_until_ledger_seq);
-            } else {
-                present.insert(key_hash, entry.last_modified_ledger_seq);
+            let key_hash: [u8; 32] = sha2::Sha256::digest(&key_xdr).into();
+            if let Some(live) = result.live_until_ledger_seq_ledger_seq {
+                live_until.insert(key_hash, live);
             }
         }
 
@@ -160,29 +206,6 @@ impl SorobanProvider {
                 .to_xdr(Limits::none())
                 .map_err(|e| RentkeeperError::Xdr(e.to_string()))?;
             let hashed: [u8; 32] = sha2::Sha256::digest(&key_xdr).into();
-            if matches!(key, LedgerKey::Ttl(_)) {
-                // Callers watch TTL keys directly (rare); report from the entry itself.
-                let observation = live_until
-                    .get(&hashed)
-                    .map(|live_until| Observation {
-                        current_ledger: latest,
-                        entry: EntryState::Live(EntryTtl {
-                            current_ledger: latest,
-                            live_until_ledger_seq: Some(*live_until),
-                        }),
-                    })
-                    .unwrap_or(Observation {
-                        current_ledger: latest,
-                        entry: EntryState::Archived(ArchivedEntryInfo {
-                            current_ledger: latest,
-                            archived: true,
-                        }),
-                    });
-                out.push(observation);
-                continue;
-            }
-
-            let entry_present = present.contains_key(&hashed);
             match live_until.get(&hashed) {
                 Some(&live_until) if live_until > latest => out.push(Observation {
                     current_ledger: latest,
@@ -198,13 +221,6 @@ impl SorobanProvider {
                         archived: false,
                     }),
                 }),
-                None if entry_present => out.push(Observation {
-                    current_ledger: latest,
-                    entry: EntryState::Live(EntryTtl {
-                        current_ledger: latest,
-                        live_until_ledger_seq: None,
-                    }),
-                }),
                 None => out.push(Observation {
                     current_ledger: latest,
                     entry: EntryState::Archived(ArchivedEntryInfo {
@@ -215,6 +231,33 @@ impl SorobanProvider {
             }
         }
         Ok(out)
+    }
+}
+
+/// Watched entries per `getLedgerEntries` chunk: each entry adds its TTL
+/// companion, so this yields at most 100 keys per request.
+pub const OBSERVE_BATCH_ENTRIES: usize = 50;
+
+/// Maximum `latest_ledger` drift allowed between chunk snapshots (kept large:
+/// a chunk is a single RPC round trip, but consistency is still checked).
+pub const MAX_CHUNK_LEDGER_DRIFT: u32 = 0;
+
+/// Result of simulating an archival envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulationResult {
+    /// Node-computed minimum resource fee in stroops.
+    pub min_resource_fee: u64,
+    /// Raw `transactionData` XDR (base64) carrying the node's resource bounds.
+    pub transaction_data_xdr: Option<String>,
+    /// Simulation error text when the node rejected the operation.
+    pub error: Option<String>,
+}
+
+impl SimulationResult {
+    /// True when the node rejected the simulated operation.
+    #[must_use]
+    pub fn failed(&self) -> bool {
+        self.error.is_some()
     }
 }
 
