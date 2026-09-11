@@ -3,6 +3,8 @@
 
 pub mod error;
 pub mod ledger_keys;
+pub mod ttl;
 
 pub use error::RentkeeperError;
 pub use ledger_keys::LedgerKeys;
+pub use ttl::{EntryTtl, TtlConstants};
