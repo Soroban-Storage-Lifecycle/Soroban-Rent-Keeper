@@ -43,6 +43,11 @@ impl Planner {
 
     /// Builds an extend plan for live entries at or below the alert horizon.
     ///
+    /// Prefer [`Planner::plan_extend_split`] for submissions: mixing
+    /// durabilities in one `ExtendFootprintTtl` is risky because temporary
+    /// entries trap when the target exceeds the network limit while
+    /// persistent entries silently clamp.
+    ///
     /// `observations` maps each candidate ledger key to its observed TTL state.
     /// Entries whose TTL is `None` (no TTL entry) or above the horizon are
     /// excluded. The plan's `extend_to` is clamped to the network
@@ -76,6 +81,50 @@ impl Planner {
             extend_to: self.window.extend_to_ledgers(&self.constants),
             entries,
         })
+    }
+
+    /// Builds one extend plan per durability class (temporary and persistent).
+    ///
+    /// Durabilities are submitted separately so a temporary entry that cannot
+    /// reach `extend_to` never traps persistent entries sharing its footprint.
+    /// Empty durability classes are omitted from the result.
+    ///
+    /// # Errors
+    /// Returns an error if any key cannot be rendered to XDR.
+    pub fn plan_extend_split(
+        &self,
+        observations: &[(LedgerKey, EntryTtl)],
+        current_ledger: u32,
+    ) -> Result<Vec<ArchivalPlan>, RentkeeperError> {
+        let mut temporary = Vec::new();
+        let mut persistent = Vec::new();
+        for (key, ttl) in observations {
+            if !self.window.is_at_risk(ttl) {
+                continue;
+            }
+            let entry = PlanEntry {
+                key_xdr: LedgerKeys::render(key)?,
+                key: key.clone(),
+                kind: OperationKind::Extend,
+                durability: durability_of(key),
+                ttl: renormalize_ttl(ttl, current_ledger),
+            };
+            match entry.durability {
+                Some(Durability::Temporary) => temporary.push(entry),
+                _ => persistent.push(entry),
+            }
+        }
+        let extend_to = self.window.extend_to_ledgers(&self.constants);
+        let mk = |entries: Vec<PlanEntry>| ArchivalPlan {
+            network_passphrase: self.network_passphrase.clone(),
+            reference_ledger: current_ledger,
+            extend_to,
+            entries,
+        };
+        Ok([mk(persistent), mk(temporary)]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect())
     }
 
     /// Builds a restore plan for archived entries.
@@ -266,6 +315,78 @@ mod tests {
         let plan = planner().plan_restore(&observations, 100).expect("plan");
         assert_eq!(plan.entries.len(), 1);
         assert_eq!(plan.entries[0].kind, OperationKind::Restore);
+    }
+
+    #[test]
+    fn split_plans_separate_durabilities_and_skip_empty() {
+        let persistent_key = data_key(ContractDataDurability::Persistent);
+        let temporary_key = data_key(ContractDataDurability::Temporary);
+        let healthy_key = data_key(ContractDataDurability::Persistent);
+        let observations = vec![
+            (
+                persistent_key,
+                EntryTtl {
+                    current_ledger: 100,
+                    live_until_ledger_seq: Some(500),
+                },
+            ),
+            (
+                temporary_key,
+                EntryTtl {
+                    current_ledger: 100,
+                    live_until_ledger_seq: Some(400),
+                },
+            ),
+            (
+                healthy_key,
+                EntryTtl {
+                    current_ledger: 100,
+                    live_until_ledger_seq: Some(500_000),
+                },
+            ),
+        ];
+        let plans = planner()
+            .plan_extend_split(&observations, 100)
+            .expect("plans");
+        assert_eq!(plans.len(), 2, "one per non-empty durability class");
+        assert_eq!(plans[0].entries.len(), 1);
+        assert_eq!(plans[0].entries[0].durability, Some(Durability::Persistent));
+        assert_eq!(plans[1].entries.len(), 1);
+        assert_eq!(plans[1].entries[0].durability, Some(Durability::Temporary));
+        // Both plans share the same target and reference ledger.
+        assert_eq!(plans[0].extend_to, plans[1].extend_to);
+        assert_eq!(plans[0].reference_ledger, plans[1].reference_ledger);
+    }
+
+    #[test]
+    fn split_plans_return_single_persistent_plan_when_no_temporary() {
+        let observations = vec![(
+            data_key(ContractDataDurability::Persistent),
+            EntryTtl {
+                current_ledger: 100,
+                live_until_ledger_seq: Some(500),
+            },
+        )];
+        let plans = planner()
+            .plan_extend_split(&observations, 100)
+            .expect("plans");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].entries[0].durability, Some(Durability::Persistent));
+    }
+
+    #[test]
+    fn split_plans_are_empty_when_nothing_at_risk() {
+        let observations = vec![(
+            data_key(ContractDataDurability::Temporary),
+            EntryTtl {
+                current_ledger: 100,
+                live_until_ledger_seq: Some(500_000),
+            },
+        )];
+        let plans = planner()
+            .plan_extend_split(&observations, 100)
+            .expect("plans");
+        assert!(plans.is_empty());
     }
 
     #[test]
