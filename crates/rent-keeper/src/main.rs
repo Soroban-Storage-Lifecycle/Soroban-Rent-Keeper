@@ -3,5 +3,6 @@
 //! submits batched `ExtendFootprintTtl` operations before eviction.
 
 mod config;
+mod metrics;
 
 fn main() {}
