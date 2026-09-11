@@ -28,3 +28,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+
+[features]
+# Gates the networked integration tests (cargo test --features integration-tests).
+integration-tests = []
