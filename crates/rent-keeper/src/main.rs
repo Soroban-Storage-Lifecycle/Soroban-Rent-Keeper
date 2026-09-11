@@ -4,5 +4,6 @@
 
 mod config;
 mod metrics;
+mod metrics_server;
 
 fn main() {}
