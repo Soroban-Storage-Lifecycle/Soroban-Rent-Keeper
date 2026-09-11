@@ -1550,6 +1550,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "restore-planner"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "humantime-serde",
+ "rentkeeper-core",
+ "serde",
+ "serde_json",
+ "stellar-strkey 0.0.16",
+ "stellar-xdr",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
