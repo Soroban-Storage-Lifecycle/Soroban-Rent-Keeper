@@ -4,6 +4,7 @@
 mod config;
 mod metrics;
 mod metrics_server;
+mod secret;
 mod watcher;
 
 use std::path::PathBuf;
@@ -65,7 +66,7 @@ async fn main() {
         return;
     }
 
-    let payer = match FeePayer::from_secret_key_str(&valid.secret_key) {
+    let payer = match FeePayer::from_secret_key_str(valid.secret_key.expose_secret()) {
         Ok(payer) => payer,
         Err(err) => {
             eprintln!("fee payer error: {err}");

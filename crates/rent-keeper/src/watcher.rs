@@ -340,7 +340,9 @@ secret_key = "SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP"
         let config = ValidConfig {
             rpc_url: "https://localhost".to_string(),
             network_passphrase: "Test".to_string(),
-            secret_key: "SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP".to_string(),
+            secret_key: crate::secret::SecretString::new(
+                "SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP".to_string(),
+            ),
             watch: vec![WatchSpec::Instance {
                 contract_id: "nonsense".to_string(),
             }],

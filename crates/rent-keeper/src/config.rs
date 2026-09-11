@@ -6,6 +6,8 @@ use rentkeeper_core::ttl::{RiskWindow, TtlConstants};
 use serde::Deserialize;
 use stellar_xdr::ReadXdr;
 
+use crate::secret::SecretString;
+
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -13,8 +15,15 @@ pub struct Config {
     pub rpc_url: String,
     /// Network passphrase, e.g. `Test SDF Network ; September 2015`.
     pub network_passphrase: String,
-    /// Secret `S...` seed of the fee payer account.
+    /// Secret `S...` seed of the fee payer account. Overridable via the
+    /// `RENT_KEEPER_SECRET_KEY` environment variable (takes precedence).
+    /// Optional when `secret_key_file` is provided.
+    #[serde(default)]
     pub secret_key: String,
+    /// Path to a file containing the fee payer secret (alternatively to
+    /// embedding it in the config file); e.g. a k8s-mounted secret.
+    #[serde(default)]
+    pub secret_key_file: Option<String>,
     /// Watch specification (entries the daemon must keep alive).
     #[serde(default)]
     pub watch: Vec<WatchSpec>,
@@ -72,8 +81,8 @@ pub struct ValidConfig {
     pub rpc_url: String,
     /// Network passphrase for signing.
     pub network_passphrase: String,
-    /// Fee payer secret (never logged).
-    pub secret_key: String,
+    /// Fee payer secret (redacted in `Debug`/`Display`).
+    pub secret_key: SecretString,
     /// Validated watch rules.
     pub watch: Vec<WatchSpec>,
     /// Poll cadence.
@@ -98,13 +107,24 @@ pub fn load_config(path: &PathBuf) -> Result<ValidConfig, String> {
     let config: Config =
         toml::from_str(&raw).map_err(|e| format!("invalid TOML in {}: {e}", path.display()))?;
 
+    // Secret resolution order: env var > secret_key_file > secret_key inline.
+    let secret = if let Ok(env_secret) = std::env::var("RENT_KEEPER_SECRET_KEY") {
+        SecretString::new(env_secret.trim().to_string())
+    } else if let Some(file_path) = &config.secret_key_file {
+        let file_secret = std::fs::read_to_string(file_path)
+            .map_err(|e| format!("cannot read secret_key_file {file_path}: {e}"))?;
+        SecretString::new(file_secret.trim().to_string())
+    } else {
+        SecretString::new(config.secret_key.clone())
+    };
+
     if config.rpc_url.is_empty() {
         return Err("rpc_url must not be empty".to_string());
     }
     if config.network_passphrase.is_empty() {
         return Err("network_passphrase must not be empty".to_string());
     }
-    if !config.secret_key.starts_with('S') {
+    if !secret.expose_secret().starts_with('S') {
         return Err("secret_key must be an S... secret strkey".to_string());
     }
     if config.poll_interval_secs == 0 {
@@ -123,7 +143,7 @@ pub fn load_config(path: &PathBuf) -> Result<ValidConfig, String> {
     Ok(ValidConfig {
         rpc_url: config.rpc_url,
         network_passphrase: config.network_passphrase,
-        secret_key: config.secret_key,
+        secret_key: secret,
         risk_window: RiskWindow::from_days(config.risk_window_days),
         poll_interval: std::time::Duration::from_secs(config.poll_interval_secs),
         watch: config.watch,
@@ -351,5 +371,58 @@ secret_key = "SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP"
     fn missing_file_is_a_clean_error() {
         let err = load_config(&PathBuf::from("/nonexistent/config.toml")).expect_err("must fail");
         assert!(err.contains("cannot read config"));
+    }
+
+    #[test]
+    fn secret_is_redacted_in_debug() {
+        let path = write_tmp("redact", &base_config());
+        let config = load_config(&path).expect("loads");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP"));
+        assert!(debug.contains("[redacted]"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn env_var_overrides_inline_secret() {
+        // SAFETY: test-only; cargo runs tests in one process but this env var
+        // is only read by load_config, and the value is a throwaway invalid
+        // marker that keeps the inline key from being used.
+        std::env::set_var(
+            "RENT_KEEPER_SECRET_KEY",
+            "STESTONLYOVERRIDEKEY00000000000000000000000000000000000000",
+        );
+        let path = write_tmp("envsec", &base_config());
+        let config = load_config(&path).expect("loads");
+        assert_eq!(
+            config.secret_key.expose_secret(),
+            "STESTONLYOVERRIDEKEY00000000000000000000000000000000000000"
+        );
+        std::env::remove_var("RENT_KEEPER_SECRET_KEY");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn secret_file_is_supported() {
+        let dir = std::env::temp_dir().join(format!("rentkeeper-secfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let secret_path = dir.join("fee-payer");
+        std::fs::write(
+            &secret_path,
+            "SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP\n",
+        )
+        .expect("write secret file");
+        let contents = base_config().replace(
+            "secret_key = \"SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP\"",
+            &format!("secret_key_file = \"{}\"", secret_path.display()),
+        );
+        let path = write_tmp("secfile", &contents);
+        let config = load_config(&path).expect("loads");
+        assert_eq!(
+            config.secret_key.expose_secret(),
+            "SBFIJNQVTU3QZGZSVAHBQFAKHRGFNIHQMIVJJSGV7HRPC7CLBR7QZL7VYP"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&path);
     }
 }
