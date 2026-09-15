@@ -255,13 +255,17 @@ pub async fn submit_plan(
     sequence: &SequenceTracker,
 ) -> Result<SubmissionOutcome, KeeperError> {
     let seq_num = sequence.next_sequence().await?;
+    // Build unsigned, simulate, apply node fees, THEN sign: the fee is part
+    // of the signed payload.
+    let public = payer.signing_key().verifying_key().to_bytes();
     let mut envelope = builder
-        .build_signed(plan, payer.signing_key(), seq_num)
+        .build_unsigned(
+            plan,
+            &stellar_xdr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::Uint256(public)),
+            seq_num,
+        )
         .map_err(|e| KeeperError::Transaction(e.to_string()))?;
 
-    // Simulate first: fail fast on invalid ops and adopt the node's resource
-    // fee instead of guessing. Simulation failure skips submission; the next
-    // cycle re-plans.
     let simulation = provider
         .simulate(&envelope)
         .await
@@ -272,12 +276,19 @@ pub async fn submit_plan(
             simulation.error.unwrap_or_default()
         )));
     }
-    if simulation.min_resource_fee > 0 {
-        tracing::debug!(resource_fee = simulation.min_resource_fee, "simulated fees");
-    }
+    builder
+        .apply_simulation(&mut envelope, &simulation)
+        .map_err(|e| KeeperError::Transaction(e.to_string()))?;
+    tracing::debug!(
+        resource_fee = simulation.min_resource_fee,
+        "simulated fees applied to envelope"
+    );
+
+    builder
+        .sign(&mut envelope, payer.signing_key())
+        .map_err(|e| KeeperError::Transaction(e.to_string()))?;
 
     let outcome = submit_extend(provider, &envelope).await?;
-    let _ = &mut envelope; // envelope consumed logically by submit
     Ok(outcome)
 }
 

@@ -134,6 +134,48 @@ impl TxBuilder {
         }))
     }
 
+    /// Applies node-computed simulation results to an *unsigned* envelope.
+    ///
+    /// Adopts the node's `transactionData` XDR (resource bounds plus resource
+    /// fee) as the `TransactionExt::V1` payload and raises `tx.fee` to
+    /// `inclusion_fee + min_resource_fee`. Must be called **before** signing:
+    /// the fee is part of the signed payload, so a post-signature fee change
+    /// would invalidate the signature.
+    ///
+    /// # Errors
+    /// Errors when the simulation's `transactionData` cannot be decoded or
+    /// does not fit the envelope's ext.
+    pub fn apply_simulation(
+        &self,
+        envelope: &mut TransactionEnvelope,
+        simulation: &crate::provider::SimulationResult,
+    ) -> Result<(), RentkeeperError> {
+        use stellar_xdr::ReadXdr as _;
+        let transaction_data = simulation
+            .transaction_data_xdr
+            .as_deref()
+            .filter(|data| !data.is_empty())
+            .ok_or_else(|| {
+                RentkeeperError::Transaction(
+                    "simulation returned no transactionData; cannot set resource fees".to_string(),
+                )
+            })?;
+        let data = SorobanTransactionData::from_xdr_base64(transaction_data, Limits::none())
+            .map_err(|e| RentkeeperError::Xdr(format!("simulation transactionData: {e}")))?;
+
+        let TransactionEnvelope::Tx(inner) = envelope else {
+            return Err(RentkeeperError::Transaction(
+                "only v1 envelopes are supported".to_string(),
+            ));
+        };
+        // Inclusion fee (base) + node-computed resource fee. Saturating so an
+        // absurd node response can never wrap into a smaller fee.
+        let total = self.base_fee.saturating_add(simulation.min_resource_fee);
+        inner.tx.fee = u32::try_from(total).unwrap_or(u32::MAX);
+        inner.tx.ext = TransactionExt::V1(data);
+        Ok(())
+    }
+
     /// Signs an envelope with the given secret key, appending one decorated
     /// signature for the fee payer.
     ///
@@ -408,6 +450,101 @@ mod tests {
                 ),
             )
             .expect("signature must verify");
+    }
+
+    #[test]
+    fn apply_simulation_sets_fee_and_resource_data_before_signing() {
+        let builder = TxBuilder::new("Test SDF Network ; September 2015");
+        let plan = sample_plan(OperationKind::Extend);
+        let payer = payer();
+        let public = payer.signing_key().verifying_key().to_bytes();
+        let mut envelope = builder
+            .build_unsigned(
+                &plan,
+                &PublicKey::PublicKeyTypeEd25519(Uint256(public)),
+                1_000,
+            )
+            .expect("unsigned");
+
+        // Node-style simulation response with real resource data.
+        let simulation = crate::provider::SimulationResult {
+            min_resource_fee: 12_345,
+            transaction_data_xdr: Some(
+                stellar_xdr::SorobanTransactionData {
+                    ext: stellar_xdr::SorobanTransactionDataExt::V0,
+                    resources: stellar_xdr::SorobanResources {
+                        footprint: stellar_xdr::LedgerFootprint {
+                            read_only: VecM::default(),
+                            read_write: VecM::try_from(plan.footprint()).expect("footprint fits"),
+                        },
+                        instructions: 1_000,
+                        disk_read_bytes: 500,
+                        write_bytes: 200,
+                    },
+                    resource_fee: 12_345,
+                }
+                .to_xdr_base64(Limits::none())
+                .expect("encode"),
+            ),
+            error: None,
+        };
+        builder
+            .apply_simulation(&mut envelope, &simulation)
+            .expect("apply");
+
+        let TransactionEnvelope::Tx(inner) = &envelope else {
+            panic!("v1 envelope");
+        };
+        // fee = inclusion (100) + min_resource_fee (12_345)
+        assert_eq!(inner.tx.fee, 12_445);
+        let TransactionExt::V1(data) = &inner.tx.ext else {
+            panic!("ext must be V1 after simulation");
+        };
+        assert_eq!(data.resource_fee, 12_345);
+        assert_eq!(data.resources.instructions, 1_000);
+
+        // And the signed envelope must still verify against its hash: sign
+        // AFTER fee application and check the signature.
+        let mut signed = envelope;
+        builder
+            .sign(&mut signed, payer.signing_key())
+            .expect("sign");
+        let network_id: [u8; 32] =
+            sha2::Sha256::digest("Test SDF Network ; September 2015".as_bytes()).into();
+        let tx_hash = signed.hash(network_id).expect("hash");
+        let TransactionEnvelope::Tx(sinner) = &signed else {
+            panic!("v1");
+        };
+        let sig = &sinner.signatures.first().expect("sig").signature;
+        use ed25519_dalek::Verifier as _;
+        payer
+            .signing_key()
+            .verifying_key()
+            .verify(
+                &tx_hash,
+                &ed25519_dalek::Signature::from_bytes(&sig.0.to_vec()[..].try_into().expect("64")),
+            )
+            .expect("signature over fee-adjusted tx must verify");
+    }
+
+    #[test]
+    fn apply_simulation_rejects_missing_transaction_data() {
+        let builder = TxBuilder::new("Test");
+        let plan = sample_plan(OperationKind::Extend);
+        let payer = payer();
+        let public = payer.signing_key().verifying_key().to_bytes();
+        let mut envelope = builder
+            .build_unsigned(&plan, &PublicKey::PublicKeyTypeEd25519(Uint256(public)), 1)
+            .expect("unsigned");
+        let simulation = crate::provider::SimulationResult {
+            min_resource_fee: 0,
+            transaction_data_xdr: None,
+            error: None,
+        };
+        let err = builder
+            .apply_simulation(&mut envelope, &simulation)
+            .expect_err("must fail");
+        assert!(err.to_string().contains("no transactionData"));
     }
 
     #[test]
